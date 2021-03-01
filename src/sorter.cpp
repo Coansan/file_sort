@@ -1,3 +1,8 @@
+#include <stdio.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 #include <assert.h>
 
 #include "sorter.h"
@@ -8,7 +13,7 @@
 
 
 t_sorter::t_sorter(int threads_n, size_t mem_bytes_sz, bool fl_asc):
-    fl_asc_(fl_asc), str_tmp_fname_base_(tmp_fname_base_)
+    fl_asc_(fl_asc), stage_i_(0), stage_files_(0), str_tmp_fname_base_(tmp_fname_base_)
 {   /* Выделяем буфера памяти, создаём массив задач,
      * запускаем пул тредов. После их запуска, менять vec_tasks_ нельзя.
      */
@@ -52,11 +57,39 @@ t_sorter::~t_sorter()
 
 //==============================================================================
 
+bool t_sorter::sort_main(const char *input_fname)
+{   // Главная функция сортировки входного файла
+    assert(NULL != input_fname);
+
+    bool res = srt_stage1(input_fname);
+    printf("srt_stage1() return: %d\n", (int)res);
+    printf("======================\n\n");
+    fflush(stdout);
+    if(!res) {
+        return false;
+    }
+
+    while(1 != stage_files_) {
+        if(!srt_stage2_merge_files()) {
+            perror("t_sorter::sort_main(): Error 1");
+            return false;
+        }
+    }
+
+    // Теперь остался только 1 файл, переименуем его
+    rename(get_fname(stage_i_, 0).c_str(), out_fname_);
+    return true;
+}
+
+//==============================================================================
+
 bool t_sorter::srt_stage1(const char *input_fname)
 {   // Данные исходного файла будут разделены на несколько отсортированных файлов,
     // каждый размером не более mem_sortint_sz_.
     const int thr_n = vec_thr_.size();
     t_file_loader file_src, file_dest;
+    stage_i_     = 0;
+    stage_files_ = 0;
 
     if(!file_src.ldr_fopen(input_fname, true)) {
         perror("Input fopen error!");
@@ -113,7 +146,7 @@ bool t_sorter::srt_stage1(const char *input_fname)
             vec_tasks_.at(i)->task_wait_4end();
         }
 
-        printf("t_sorter::srt_stage1(): [%2d]  Megre start\n", file_i);
+        printf("t_sorter::srt_stage1(): [%2d]  Merge start\n", file_i);
         fflush(stdout);
 
         // Теперь отсортированные части нужно слить и записать в выходной файл
@@ -126,12 +159,82 @@ bool t_sorter::srt_stage1(const char *input_fname)
             return false;
         }
         file_dest.ldr_fclose(true);
-        printf("t_sorter::srt_stage1(): [%2d]  Megre ok\n\n", file_i);
+        printf("t_sorter::srt_stage1(): [%2d]  Merge ok\n\n", file_i);
         fflush(stdout);
 
         ++file_i;
     } // while(...)
 
+    // Если в входной файл был пустой, то и временных файлов не будет создано
+    stage_i_     = 1;
+    stage_files_ = file_i;
+    return true;
+}
+
+//==============================================================================
+
+bool t_sorter::srt_stage2_merge_files()
+{   /* Объединяем временные файлы поколения stage_i_, количество - stage_files_,
+     * по merge_files_max_k_ штук в отсортированные файлы нового поколения.
+     * stage_i_, stage_files_ - установятся новые. Старые файлы удаляем.
+     */
+    assert(stage_i_ >= 1 && stage_files_ > 1);
+
+    const int stage_i_new = stage_i_ + 1;
+    int files_remain = stage_files_; // сколько файлов осталось слить
+    int file_in_i    = 0;            // Индекс текущего временного файла для чтения
+    int file_out_i   = 0;            // Индекс текущего временного файла для записи
+    t_file_loader file_dest;
+    std::vector<t_file_loader> src_files(merge_files_max_k_);
+    t_vec_data_stream v_mpart;
+    v_mpart.reserve(merge_files_max_k_);
+
+    while(files_remain > 0) {
+        // Инициализируем входные потоки данных
+        const int files_k = (files_remain > merge_files_max_k_) ? merge_files_max_k_ : files_remain;
+        v_mpart.clear();
+        const size_t mempart_sz = mem_sortint_sz_ / files_k;
+
+        for(int i = 0; i < files_k; ++i) {
+            if(!src_files.at(i).ldr_fopen(get_fname(stage_i_, file_in_i++).c_str(), true)) {
+                perror("ldr_fopen()");
+                return false;
+            }
+
+            // Рассчитываем, что объекты в v_mpart не будут неявно уничтожаться, иначе жопа открытым файлам.
+            v_mpart.emplace_back();
+            v_mpart.back().dstr_set_mem(p_sort_mem_ + mempart_sz * i, p_sort_mem_ + mempart_sz * (i + 1), false);
+            v_mpart.back().dstr_set_file_ldr(&(src_files.at(i)));
+        }
+
+        // Файл для вывода
+        std::string &fout_name = get_fname(stage_i_new, file_out_i++);
+        if(!file_dest.ldr_fopen(fout_name.c_str(), false)) {
+            perror("Output for merge fopen error 2 !");
+            return false;
+        }
+
+        printf("t_sorter::srt_stage2_merge_files(): Start merge to  %s\n", fout_name.c_str());
+        fflush(stdout);
+
+        if(!merge_data(v_mpart, file_dest)) {
+            perror("merge_data() error 2 !");
+            return false;
+        }
+        file_dest.ldr_fclose(true);
+        printf("t_sorter::srt_stage2_merge_files(): Ok\n\n");
+        fflush(stdout);
+
+        // Новый временный файл получен, открытые входные файлы закроются сами на следующем заходе
+        files_remain -= files_k;
+    }
+
+    // Сейчас готово новое поколение временных файлов.
+    // Закрываем старые файлы и удаляем.
+    src_files.clear();
+    rm_temp_files();
+    stage_i_     = stage_i_new;
+    stage_files_ = file_out_i;
     return true;
 }
 
@@ -256,6 +359,16 @@ bool t_sorter::merge_data(t_vec_data_stream &vec_data_stream, t_file_loader &fil
 }
 
 //==============================================================================
+
+void t_sorter::rm_temp_files()
+{   // Удаляет временные файлы
+    for(int i = 0; i < stage_files_; ++i) {
+        unlink(get_fname(stage_i_, i).c_str());
+    }
+}
+
+
+//==============================================================================
 //==============================================================================
 //==============================================================================
 //==============================================================================
@@ -303,8 +416,8 @@ int main(int argc, const char *argv[])
     printf("\nt_sorter( thr_n: %2d, %4d MB, fl_asc: %d ) Created\n\n", thr_n, mem_mb, (int)fl_asc);
     fflush(stdout);
 
-    bool res = sorter.srt_stage1(argv[1]);
-    printf("srt_stage1 return: %d\n\n", (int)res);
+    bool res = sorter.sort_main(argv[1]);
+    printf("sorter.sort_main() return: %d\n\n", (int)res);
 
     return 0;
 }
